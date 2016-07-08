@@ -25,10 +25,6 @@ type SolveArgs struct {
 	// The path to the root of the project on which the solver is working.
 	Root string
 
-	// The 'name' of the project. Required. This should (must?) correspond to subpath of
-	// Root that exists under a GOPATH.
-	Name ProjectName
-
 	// The root manifest. Required. This contains all the dependencies, constraints, and
 	// other controls available to the root project.
 	Manifest Manifest
@@ -170,7 +166,7 @@ func Prepare(args SolveArgs, opts SolveOpts, sm SourceManager) (Solver, error) {
 	if args.Root == "" {
 		return nil, badOptsFailure("Opts must specify a non-empty string for the project root directory. If cwd is desired, use \".\"")
 	}
-	if args.Name == "" {
+	if args.Manifest.Name() == "" {
 		return nil, badOptsFailure("Opts must include a project name. This should be the intended root import path of the project.")
 	}
 	if opts.Trace && opts.TraceLogger == nil {
@@ -213,6 +209,18 @@ func Prepare(args SolveArgs, opts SolveOpts, sm SourceManager) (Solver, error) {
 		cmp: s.unselectedComparator,
 	}
 
+	// Prep safe, normalized versions of root manifest and lock data
+	s.rm = prepManifest(s.args.Manifest, s.args.Manifest.Name())
+	if s.args.Lock != nil {
+		for _, lp := range s.args.Lock.Projects() {
+			s.rlm[lp.Ident().normalize()] = lp
+		}
+
+		// Also keep a prepped one, mostly for the bridge. This is probably
+		// wasteful, but only minimally so, and yay symmetry
+		s.rl = prepLock(s.args.Lock)
+	}
+
 	return s, nil
 }
 
@@ -226,18 +234,6 @@ func (s *solver) Solve() (Solution, error) {
 	err := s.b.verifyRoot(s.args.Root)
 	if err != nil {
 		return nil, err
-	}
-
-	// Prep safe, normalized versions of root manifest and lock data
-	s.rm = prepManifest(s.args.Manifest, s.args.Name)
-	if s.args.Lock != nil {
-		for _, lp := range s.args.Lock.Projects() {
-			s.rlm[lp.Ident().normalize()] = lp
-		}
-
-		// Also keep a prepped one, mostly for the bridge. This is probably
-		// wasteful, but only minimally so, and yay symmetry
-		s.rl = prepLock(s.args.Lock)
 	}
 
 	for _, v := range s.o.ToChange {
@@ -387,7 +383,7 @@ func (s *solver) solve() (map[atom]map[string]struct{}, error) {
 func (s *solver) selectRoot() error {
 	pa := atom{
 		id: ProjectIdentifier{
-			LocalName: s.args.Name,
+			LocalName: s.rm.Name(),
 		},
 		// This is a hack so that the root project doesn't have a nil version.
 		// It's sort of OK because the root never makes it out into the results.

@@ -25,7 +25,7 @@ func (s *solver) HashInputs() ([]byte, error) {
 	}
 
 	// Pass in magic root values, and the bridge will analyze the right thing
-	ptree, err := s.b.listPackages(ProjectIdentifier{LocalName: s.args.Name}, nil)
+	ptree, err := s.b.listPackages(ProjectIdentifier{LocalName: s.rm.Name()}, nil)
 	if err != nil {
 		return nil, badOptsFailure(fmt.Sprintf("Error while parsing imports under %s: %s", s.args.Root, err.Error()))
 	}

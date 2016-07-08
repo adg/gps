@@ -11,7 +11,6 @@ func TestHashInputs(t *testing.T) {
 
 	args := SolveArgs{
 		Root:     string(fix.ds[0].Name()),
-		Name:     fix.ds[0].Name(),
 		Manifest: fix.ds[0],
 		Ignore:   []string{"foo", "bar"},
 	}

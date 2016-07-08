@@ -64,7 +64,6 @@ func solveBasicsAndCheck(fix basicFixture, t *testing.T) (res Solution, err erro
 
 	args := SolveArgs{
 		Root:     string(fix.ds[0].Name()),
-		Name:     ProjectName(fix.ds[0].Name()),
 		Manifest: fix.ds[0],
 		Lock:     dummyLock{},
 	}
@@ -117,7 +116,6 @@ func solveBimodalAndCheck(fix bimodalFixture, t *testing.T) (res Solution, err e
 
 	args := SolveArgs{
 		Root:     string(fix.ds[0].Name()),
-		Name:     ProjectName(fix.ds[0].Name()),
 		Manifest: fix.ds[0],
 		Lock:     dummyLock{},
 		Ignore:   fix.ignore,
@@ -275,7 +273,6 @@ func TestRootLockNoVersionPairMatching(t *testing.T) {
 
 	args := SolveArgs{
 		Root:     string(fix.ds[0].Name()),
-		Name:     ProjectName(fix.ds[0].Name()),
 		Manifest: fix.ds[0],
 		Lock:     l2,
 	}
@@ -333,8 +330,7 @@ func TestBadSolveOpts(t *testing.T) {
 		t.Errorf("Should have errored on missing manifest")
 	}
 
-	m, _, _ := sm.GetProjectInfo(basicFixtures[0].ds[0].n, basicFixtures[0].ds[0].v)
-	args.Manifest = m
+	args.Manifest = SimpleManifest{}
 	_, err = Prepare(args, o, sm)
 	if err == nil {
 		t.Errorf("Should have errored on empty root")
@@ -346,7 +342,8 @@ func TestBadSolveOpts(t *testing.T) {
 		t.Errorf("Should have errored on empty name")
 	}
 
-	args.Name = "root"
+	m, _, _ := sm.GetProjectInfo(basicFixtures[0].ds[0].n, basicFixtures[0].ds[0].v)
+	args.Manifest = m
 	_, err = Prepare(args, o, sm)
 	if err != nil {
 		t.Errorf("Basic conditions satisfied, solve should have gone through, err was %s", err)
@@ -371,7 +368,6 @@ func TestIgnoreDedupe(t *testing.T) {
 	ig := []string{"foo", "foo", "bar"}
 	args := SolveArgs{
 		Root:     string(fix.ds[0].Name()),
-		Name:     ProjectName(fix.ds[0].Name()),
 		Manifest: fix.ds[0],
 		Ignore:   ig,
 	}
