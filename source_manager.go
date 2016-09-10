@@ -3,10 +3,12 @@ package gps
 import (
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/Masterminds/semver"
 )
@@ -82,15 +84,17 @@ type ProjectAnalyzer interface {
 // There's no (planned) reason why it would need to be reimplemented by other
 // tools; control via dependency injection is intended to be sufficient.
 type SourceMgr struct {
-	cachedir string
-	srcs     map[string]source
-	srcmut   sync.RWMutex
-	an       ProjectAnalyzer
-	dxt      deducerTrie
-	rootxt   prTrie
-	qch      chan os.Signal
-	released int32
-	glock    sync.RWMutex
+	cachedir            string
+	srcs                map[string]source
+	srcmut              sync.RWMutex
+	an                  ProjectAnalyzer
+	dxt                 deducerTrie
+	rootxt              prTrie
+	signaled            int32
+	sigch               chan os.Signal
+	qch                 chan struct{}
+	releasing, released int32
+	glock               sync.RWMutex
 }
 
 type smIsReleased struct{}
@@ -135,13 +139,65 @@ func NewSourceManager(an ProjectAnalyzer, cachedir string, force bool) (*SourceM
 		return nil, fmt.Errorf("failed to create global cache lock file at %s with err %s", glpath, err)
 	}
 
-	return &SourceMgr{
+	sm := &SourceMgr{
 		cachedir: cachedir,
 		srcs:     make(map[string]source),
 		an:       an,
 		dxt:      pathDeducerTrie(),
 		rootxt:   newProjectRootTrie(),
-	}, nil
+		qch:      make(chan struct{}),
+		sigch:    make(chan os.Signal),
+	}
+
+	signal.Notify(sm.sigch, syscall.SIGINT, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGQUIT, os.Interrupt)
+
+	sigfunc := func(ch <-chan os.Signal) {
+		for {
+			select {
+			case <-ch:
+				// First, CAS the signaled marker. This ensures that, even if
+				// two signals are sent in such rapid succession that they
+				// interleave (is this even realistically possible?), one of our
+				// threads follows the nice path, and the other follows the
+				// aggressive path.
+				if atomic.CompareAndSwapInt32(&sm.signaled, 0, 1) {
+					// Nice path - wait to remove the disk lock file until the
+					// global sm lock is clear.
+					if !atomic.CompareAndSwapInt32(&sm.releasing, 0, 1) {
+						// Something's already begun releasing the sm, so we
+						// don't have to do anything, as we'd just be redoing
+						// that work. Instead, we can just return.
+						return
+					}
+
+					fmt.Println("Cleaning up...")
+					// Now, wait for the global lock to clear
+					sm.glock.Lock()
+					sm.doRelease()
+					sm.glock.Unlock()
+				} else {
+					// Aggressive path - we don't care about the global lock,
+					// we're shutting down right away. We don't need to CAS
+					// releasing because it wouldn't change the behavior either
+					// way. Instead, we make sure it's marked so everything else
+					// behaves well.
+					atomic.StoreInt32(&sm.releasing, 1)
+					sm.doRelease()
+				}
+
+				return
+			case <-sm.qch:
+				// quit channel triggered - all we have to do is return
+				return
+			}
+		}
+	}
+
+	// Two, so that the second can hop past the global lock and immediately quit
+	go sigfunc(sm.sigch)
+	go sigfunc(sm.sigch)
+
+	return sm, nil
 }
 
 // Release lets go of any locks held by the SourceManager.
@@ -151,7 +207,7 @@ func (sm *SourceMgr) Release() {
 	//
 	// Setting it before we acquire the lock also guarantees that no _more_
 	// method calls will stack up.
-	if !atomic.CompareAndSwapInt32(&sm.released, 0, 1) {
+	if !atomic.CompareAndSwapInt32(&sm.releasing, 0, 1) {
 		return
 	}
 
@@ -160,8 +216,22 @@ func (sm *SourceMgr) Release() {
 	//
 	// (This could deadlock, ofc)
 	sm.glock.Lock()
-	os.Remove(filepath.Join(sm.cachedir, "sm.lock"))
+	sm.doRelease()
 	sm.glock.Unlock()
+}
+
+// doRelease actually releases physical resources (files on disk, etc.).
+func (sm *SourceMgr) doRelease() {
+	// One last atomic marker ensures actual disk changes only happen once.
+	if atomic.CompareAndSwapInt32(&sm.released, 0, 1) {
+		// Remove the lock file from disk
+		os.Remove(filepath.Join(sm.cachedir, "sm.lock"))
+		// deregister the signal channel. It's fine for this to happen more than
+		// once.
+		signal.Stop(sm.sigch)
+		// close the qch so the signal handlers run out
+		close(sm.qch)
+	}
 }
 
 // AnalyzerInfo reports the name and version of the injected ProjectAnalyzer.
@@ -177,7 +247,7 @@ func (sm *SourceMgr) AnalyzerInfo() (name string, version *semver.Version) {
 // The work of producing the manifest and lock is delegated to the injected
 // ProjectAnalyzer's DeriveManifestAndLock() method.
 func (sm *SourceMgr) GetManifestAndLock(id ProjectIdentifier, v Version) (Manifest, Lock, error) {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return nil, nil, smIsReleased{}
 	}
 	sm.glock.RLock()
@@ -196,7 +266,7 @@ func (sm *SourceMgr) GetManifestAndLock(id ProjectIdentifier, v Version) (Manife
 // ListPackages parses the tree of the Go packages at and below the ProjectRoot
 // of the given ProjectIdentifier, at the given version.
 func (sm *SourceMgr) ListPackages(id ProjectIdentifier, v Version) (PackageTree, error) {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return PackageTree{}, smIsReleased{}
 	}
 	sm.glock.RLock()
@@ -225,7 +295,7 @@ func (sm *SourceMgr) ListPackages(id ProjectIdentifier, v Version) (PackageTree,
 // is not accessible (network outage, access issues, or the resource actually
 // went away), an error will be returned.
 func (sm *SourceMgr) ListVersions(id ProjectIdentifier) ([]Version, error) {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return nil, smIsReleased{}
 	}
 	sm.glock.RLock()
@@ -245,7 +315,7 @@ func (sm *SourceMgr) ListVersions(id ProjectIdentifier) ([]Version, error) {
 // RevisionPresentIn indicates whether the provided Revision is present in the given
 // repository.
 func (sm *SourceMgr) RevisionPresentIn(id ProjectIdentifier, r Revision) (bool, error) {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return false, smIsReleased{}
 	}
 	sm.glock.RLock()
@@ -265,7 +335,7 @@ func (sm *SourceMgr) RevisionPresentIn(id ProjectIdentifier, r Revision) (bool, 
 // SourceExists checks if a repository exists, either upstream or in the cache,
 // for the provided ProjectIdentifier.
 func (sm *SourceMgr) SourceExists(id ProjectIdentifier) (bool, error) {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return false, smIsReleased{}
 	}
 	sm.glock.RLock()
@@ -286,7 +356,7 @@ func (sm *SourceMgr) SourceExists(id ProjectIdentifier) (bool, error) {
 //
 // The primary use case for this is prefetching.
 func (sm *SourceMgr) SyncSourceFor(id ProjectIdentifier) error {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return smIsReleased{}
 	}
 	sm.glock.RLock()
@@ -305,7 +375,7 @@ func (sm *SourceMgr) SyncSourceFor(id ProjectIdentifier) error {
 // ExportProject writes out the tree of the provided ProjectIdentifier's
 // ProjectRoot, at the provided version, to the provided directory.
 func (sm *SourceMgr) ExportProject(id ProjectIdentifier, v Version, to string) error {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return smIsReleased{}
 	}
 	sm.glock.RLock()
@@ -329,7 +399,7 @@ func (sm *SourceMgr) ExportProject(id ProjectIdentifier, v Version, to string) e
 // paths. (A special exception is written for gopkg.in to minimize network
 // activity, as its behavior is well-structured)
 func (sm *SourceMgr) DeduceProjectRoot(ip string) (ProjectRoot, error) {
-	if atomic.CompareAndSwapInt32(&sm.released, 1, 1) {
+	if atomic.CompareAndSwapInt32(&sm.releasing, 1, 1) {
 		return "", smIsReleased{}
 	}
 	sm.glock.RLock()
